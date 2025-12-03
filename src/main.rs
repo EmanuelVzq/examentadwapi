@@ -4,6 +4,7 @@ use chrono::{Duration, Utc};
 use dotenvy::dotenv;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Pool, Postgres};
 use std::env;
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 struct AppState {
     db_pool: Pool<Postgres>,
     jwt_secret: String,
+    http_client: reqwest::Client,
 }
 
 // =========================
@@ -159,7 +161,7 @@ fn decode_jwt(token: &str, secret: &str) -> Option<Claims> {
 }
 
 // =========================
-// Handlers
+// Handlers Auth (Etapa 1)
 // =========================
 
 // POST /auth/register  (para pruebas / semilla)
@@ -386,6 +388,163 @@ async fn change_password(
 }
 
 // =========================
+// Etapa 2 – Root y People
+// =========================
+
+// Root local tipo:
+// {
+//   "films": ".../films/",
+//   "people": ".../people/",
+//   ...
+// }
+#[derive(Serialize)]
+struct LocalRoot {
+    films: String,
+    people: String,
+    planets: String,
+    species: String,
+    starships: String,
+    vehicles: String,
+}
+
+async fn api_root() -> impl Responder {
+    // En local usas tu host/puerto:
+    let base = "http://127.0.0.1:4000/examen/api/v1";
+
+    let res = LocalRoot {
+        films: format!("{base}/films/"),
+        people: format!("{base}/people/"),
+        planets: format!("{base}/planets/"),
+        species: format!("{base}/species/"),
+        starships: format!("{base}/starships/"),
+        vehicles: format!("{base}/vehicles/"),
+    };
+
+    HttpResponse::Ok().json(res)
+}
+
+// POST /admin/sync/people
+// Baja people de SWAPI y las guarda en la tabla `people`
+async fn sync_people(
+    data: web::Data<AppState>,
+    req: HttpRequest,
+) -> impl Responder {
+    // Verificar token y rol admin
+    let token = match extract_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().body("Falta token"),
+    };
+
+    let claims = match decode_jwt(&token, &data.jwt_secret) {
+        Some(c) => c,
+        None => return HttpResponse::Unauthorized().body("Token inválido"),
+    };
+
+    if claims.role != "admin" {
+        return HttpResponse::Forbidden().body("Solo admin puede sincronizar");
+    }
+
+    let client = &data.http_client;
+    let mut url = "https://swapi.dev/api/people/".to_string();
+    let mut total_insertados = 0;
+
+    loop {
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error llamando SWAPI: {e}");
+                return HttpResponse::BadGateway().body("Error llamando SWAPI");
+            }
+        };
+
+        let json: Value = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("Error parseando JSON SWAPI: {e}");
+                return HttpResponse::InternalServerError().body("Error JSON");
+            }
+        };
+
+        let results = json["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        for person in results {
+            if let Some(url_person) = person["url"].as_str() {
+                // extraer id: https://swapi.dev/api/people/1/ → 1
+                if let Some(id_str) = url_person.trim_end_matches('/').rsplit('/').next() {
+                    if let Ok(swapi_id) = id_str.parse::<i32>() {
+                        let res = sqlx::query!(
+                            r#"
+                            INSERT INTO people (swapi_id, data)
+                            VALUES ($1, $2)
+                            ON CONFLICT (swapi_id) DO UPDATE SET data = EXCLUDED.data
+                            "#,
+                            swapi_id,
+                            person
+                        )
+                        .execute(&data.db_pool)
+                        .await;
+
+                        match res {
+                            Ok(_) => total_insertados += 1,
+                            Err(e) => eprintln!("Error insertando people {swapi_id}: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+
+        // siguiente página
+        if let Some(next_url) = json["next"].as_str() {
+            url = next_url.to_string();
+        } else {
+            break;
+        }
+    }
+
+    HttpResponse::Ok().body(format!(
+        "Sincronización de people completada ({} registros procesados)",
+        total_insertados
+    ))
+}
+
+// GET /examen/api/v1/people/
+#[derive(Serialize)]
+struct PeopleResponse {
+    count: usize,
+    results: Vec<Value>,
+}
+
+async fn list_people(data: web::Data<AppState>) -> impl Responder {
+    let rows = sqlx::query!(
+        r#"
+        SELECT data
+        FROM people
+        ORDER BY swapi_id
+        "#
+    )
+    .fetch_all(&data.db_pool)
+    .await;
+
+    match rows {
+        Ok(rs) => {
+            let results: Vec<Value> = rs.into_iter().map(|r| r.data).collect();
+            let res = PeopleResponse {
+                count: results.len(),
+                results,
+            };
+            HttpResponse::Ok().json(res)
+        }
+        Err(e) => {
+            eprintln!("Error leyendo people de BD: {e}");
+            HttpResponse::InternalServerError().body("Error leyendo BD")
+        }
+    }
+}
+
+// =========================
 // main
 // =========================
 
@@ -400,9 +559,15 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("No se pudo conectar a Supabase");
 
-    let state = AppState { db_pool, jwt_secret };
+    let http_client = reqwest::Client::new();
 
-    println!("🚀 Backend Etapa 1 en http://127.0.0.1:4000");
+    let state = AppState {
+        db_pool,
+        jwt_secret,
+        http_client,
+    };
+
+    println!("🚀 Backend en http://127.0.0.1:4000");
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -413,10 +578,15 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(cors)
             .app_data(web::Data::new(state.clone()))
+            // Etapa 1: auth
             .route("/auth/register", web::post().to(register))
             .route("/auth/login", web::post().to(login))
             .route("/auth/me", web::get().to(me))
             .route("/auth/change-password", web::post().to(change_password))
+            // Etapa 2: root y people
+            .route("/examen/api/v1", web::get().to(api_root))
+            .route("/examen/api/v1/people/", web::get().to(list_people))
+            .route("/admin/sync/people", web::post().to(sync_people))
     })
     .bind(("127.0.0.1", 4000))?
     .run()
